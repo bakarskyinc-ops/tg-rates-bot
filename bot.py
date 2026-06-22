@@ -13,53 +13,68 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = os.environ["CHANNEL_ID"]
-ALPHA_KEY = os.environ["ALPHA_KEY"]
 
 UPDATE_HOURS = [9, 14, 20]
 TZ_OFFSET = timedelta(hours=5)
+TROY_OZ = 31.1035
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ─────────────────────────────────────────────
-# Получение курсов через Alpha Vantage
+# Получение курсов с ЦБ РУз
 # ─────────────────────────────────────────────
 
-async def get_price(session, from_currency: str) -> float | None:
-    url = (
-        f"https://www.alphavantage.co/query"
-        f"?function=CURRENCY_EXCHANGE_RATE"
-        f"&from_currency={from_currency}"
-        f"&to_currency=USD"
-        f"&apikey={ALPHA_KEY}"
-    )
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            data = await r.json()
-            rate = data["Realtime Currency Exchange Rate"]["5. Exchange Rate"]
-            return float(rate)
-    except Exception as e:
-        logger.warning(f"{from_currency} failed: {e}")
-        return None
-
-
 async def get_metal_prices() -> dict | None:
+    """
+    ЦБ РУз публикует курсы XAU, XAG, XPT в сумах за тройскую унцию.
+    USD тоже берём оттуда — пересчитываем в доллары за унцию.
+    """
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
     connector = aiohttp.TCPConnector(ssl=ssl_ctx)
 
-    async with aiohttp.ClientSession(connector=connector) as session:
-        gold     = await get_price(session, "XAU")
-        silver   = await get_price(session, "XAG")
-        platinum = await get_price(session, "XPT")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
+        "Accept": "application/json",
+        "Referer": "https://cbu.uz/"
+    }
 
-        if gold and silver and platinum:
-            logger.info(f"Курсы: gold={gold}, silver={silver}, platinum={platinum}")
-            return {"gold": gold, "silver": silver, "platinum": platinum}
+    try:
+        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+            async with session.get(
+                "https://cbu.uz/uz/arkhiv-kursov-valyut/json/",
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                data = await r.json(content_type=None)
 
-    logger.error("Не удалось получить курсы")
-    return None
+                rates = {}
+                for item in data:
+                    ccy = item.get("Ccy")
+                    if ccy in ("USD", "XAU", "XAG", "XPT"):
+                        nominal = float(item.get("Nominal", 1))
+                        rates[ccy] = float(item["Rate"]) / nominal
+
+                if not all(k in rates for k in ("USD", "XAU", "XAG", "XPT")):
+                    logger.error(f"ЦБ: не все курсы найдены. Получено: {list(rates.keys())}")
+                    return None
+
+                usd = rates["USD"]  # UZS за 1 USD
+
+                # ЦБ даёт UZS за тройскую унцию → делим на курс USD
+                result = {
+                    "gold":     rates["XAU"] / usd,
+                    "silver":   rates["XAG"] / usd,
+                    "platinum": rates["XPT"] / usd,
+                    "usd_uzs":  usd,
+                }
+                logger.info(f"ЦБ РУз: {result}")
+                return result
+
+    except Exception as e:
+        logger.error(f"ЦБ API error: {e}")
+        return None
 
 
 def format_message(gold: float, silver: float, platinum: float) -> str:
@@ -175,7 +190,8 @@ async def cmd_status(message: Message):
         f"🤖 Статус бота\n"
         f"Время (UTC+5): {now.strftime('%d.%m.%Y %H:%M')}\n"
         f"PINNED_MSG_ID: {pinned_message_id or 'не задан'}\n"
-        f"Расписание: {', '.join(f'{h}:00' for h in UPDATE_HOURS)}"
+        f"Расписание: {', '.join(f'{h}:00' for h in UPDATE_HOURS)}\n"
+        f"Источник: ЦБ РУз"
     )
 
 
