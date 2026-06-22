@@ -21,15 +21,11 @@ TZ_OFFSET    = timedelta(hours=5)
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
-# ─────────────────────────────────────────────
-# Получение курсов
-# ─────────────────────────────────────────────
-
 BASE_URL = "https://real-time-metal-prices.p.rapidapi.com/api/v1/radpidhub"
 
 METALS = {
-    "gold":   "gold-price/USD",
-    "silver": "silver-price/USD",
+    "gold":   ("gold-price/USD",   "XAU_ounce"),
+    "silver": ("silver-price/USD", "XAG_ounce"),
 }
 
 async def get_metal_prices() -> dict | None:
@@ -46,48 +42,32 @@ async def get_metal_prices() -> dict | None:
 
     result = {}
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        for metal, path in METALS.items():
+        for metal, (path, rate_key) in METALS.items():
             url = f"{BASE_URL}/{path}"
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
                     data = await r.json()
-                    logger.info(f"{metal} raw response: {data}")
-                    # Пробуем разные поля
-                    price = (
-                        data.get("price_usd_per_troy_oz") or
-                        data.get("price") or
-                        data.get("rate") or
-                        data.get("ask") or
-                        data.get("Price") or
-                        0
-                    )
-                    price = float(price)
+                    price = float(data["rates"][rate_key])
                     if price > 0:
                         result[metal] = price
-                    else:
-                        logger.warning(f"{metal} — нет цены: {data}")
+                        logger.info(f"{metal}: ${price}")
             except Exception as e:
                 logger.warning(f"{metal} failed: {e}")
 
     if all(k in result for k in ("gold", "silver")):
         return result
 
-    logger.error(f"Не удалось получить курсы. Получено: {result}")
+    logger.error(f"Не удалось получить курсы: {result}")
     return None
 
 
 def is_trading_day() -> bool:
-    now = datetime.now(timezone.utc) + TZ_OFFSET
-    return now.weekday() < 5
+    return (datetime.now(timezone.utc) + TZ_OFFSET).weekday() < 5
 
 
 def format_message(gold: float, silver: float) -> str:
     return f"Gold ${gold:,.2f}  |  Silver ${silver:,.2f}"
 
-
-# ─────────────────────────────────────────────
-# Закреплённое сообщение
-# ─────────────────────────────────────────────
 
 pinned_message_id: int | None = None
 
@@ -134,30 +114,20 @@ async def send_or_update_rates():
         logger.error(f"Ошибка: {e}")
 
 
-# ─────────────────────────────────────────────
-# Расписание
-# ─────────────────────────────────────────────
-
 async def scheduler():
     await asyncio.sleep(3)
-    logger.info(f"Планировщик запущен. {UPDATE_HOURS} UTC+5, Пн-Пт")
+    logger.info(f"Планировщик: {UPDATE_HOURS} UTC+5, Пн-Пт")
     await send_or_update_rates()
 
     while True:
         now = datetime.now(timezone.utc) + TZ_OFFSET
         cur = now.hour * 60 + now.minute
-
         nxt = next((h * 60 for h in UPDATE_HOURS if h * 60 > cur), UPDATE_HOURS[0] * 60 + 1440)
         wait = (nxt - cur) * 60 - now.second
         logger.info(f"Следующее в {(now + timedelta(seconds=wait)).strftime('%H:%M')} (через {wait//60} мин)")
-
         await asyncio.sleep(wait)
         await send_or_update_rates()
 
-
-# ─────────────────────────────────────────────
-# Команды
-# ─────────────────────────────────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
