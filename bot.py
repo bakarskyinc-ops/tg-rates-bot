@@ -1,8 +1,9 @@
 import os
 import asyncio
 import logging
+import ssl
 from datetime import datetime, timezone, timedelta
-import yfinance as yf
+import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -10,43 +11,66 @@ from aiogram.types import Message
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+CHANNEL_ID  = os.environ["CHANNEL_ID"]
+RAPIDAPI_KEY = os.environ["RAPIDAPI_KEY"]
 
 UPDATE_HOURS = [9, 14, 20]
-TZ_OFFSET = timedelta(hours=5)
+TZ_OFFSET    = timedelta(hours=5)
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp  = Dispatcher()
 
 # ─────────────────────────────────────────────
-# Получение курсов через Yahoo Finance
+# Получение курсов — Real-Time Metal Prices
 # ─────────────────────────────────────────────
 
-def fetch_price(ticker: str) -> float | None:
-    try:
-        t = yf.Ticker(ticker)
-        price = t.fast_info.last_price
-        if price and price > 0:
-            return float(price)
-    except Exception as e:
-        logger.warning(f"{ticker} failed: {e}")
-    return None
-
+METALS = {
+    "gold":     "gold-price/USD",
+    "silver":   "silver-price/USD",
+    "platinum": "platinum-price/USD",
+}
 
 async def get_metal_prices() -> dict | None:
-    loop = asyncio.get_event_loop()
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
 
-    gold     = await loop.run_in_executor(None, fetch_price, "GC=F")
-    silver   = await loop.run_in_executor(None, fetch_price, "SI=F")
-    platinum = await loop.run_in_executor(None, fetch_price, "PL=F")
+    headers = {
+        "x-rapidapi-key":  RAPIDAPI_KEY,
+        "x-rapidapi-host": "real-time-metal-prices.p.rapidapi.com",
+        "Content-Type":    "application/json",
+    }
 
-    if gold and silver and platinum:
-        logger.info(f"Yahoo: gold={gold}, silver={silver}, platinum={platinum}")
-        return {"gold": gold, "silver": silver, "platinum": platinum}
+    result = {}
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+        for metal, path in METALS.items():
+            url = f"https://real-time-metal-prices.p.rapidapi.com/{path}"
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    data = await r.json()
+                    # Ответ: {"price": 3300.5, "unit": "troy_oz", ...}
+                    price = float(data.get("price") or data.get("rate") or data.get("ask") or 0)
+                    if price > 0:
+                        result[metal] = price
+                        logger.info(f"{metal}: ${price}")
+                    else:
+                        logger.warning(f"{metal} — нет цены в ответе: {data}")
+            except Exception as e:
+                logger.warning(f"{metal} failed: {e}")
 
-    logger.error("Не удалось получить курсы с Yahoo Finance")
+    if all(k in result for k in ("gold", "silver", "platinum")):
+        return result
+
+    logger.error(f"Не удалось получить все курсы. Получено: {result}")
     return None
+
+
+def is_trading_day() -> bool:
+    """Пн-Пт — торговые дни, Сб-Вс — нет"""
+    now = datetime.now(timezone.utc) + TZ_OFFSET
+    return now.weekday() < 5  # 0=Пн, 4=Пт, 5=Сб, 6=Вс
 
 
 def format_message(gold: float, silver: float, platinum: float) -> str:
@@ -74,6 +98,10 @@ async def load_pinned_msg_id():
 
 async def send_or_update_rates():
     global pinned_message_id
+
+    if not is_trading_day():
+        logger.info("Выходной день — пропуск обновления")
+        return
 
     metals = await get_metal_prices()
     if not metals:
@@ -104,12 +132,12 @@ async def send_or_update_rates():
 
 
 # ─────────────────────────────────────────────
-# Расписание: 09:00, 14:00, 20:00 Ташкент
+# Расписание: 09:00, 14:00, 20:00 Ташкент (Пн-Пт)
 # ─────────────────────────────────────────────
 
 async def scheduler():
     await asyncio.sleep(3)
-    logger.info(f"Планировщик запущен. Обновления в {UPDATE_HOURS} по UTC+5")
+    logger.info(f"Планировщик запущен. Обновления в {UPDATE_HOURS} по UTC+5 (только Пн-Пт)")
     await send_or_update_rates()
 
     while True:
@@ -141,7 +169,7 @@ async def scheduler():
 async def cmd_start(message: Message):
     await message.answer(
         "✅ Бот курсов металлов активен.\n"
-        "Обновления в 09:00, 14:00, 20:00 по Ташкенту.\n\n"
+        "Обновления в 09:00, 14:00, 20:00 по Ташкенту (Пн-Пт).\n\n"
         "/rates — текущие курсы\n"
         "/status — статус бота"
     )
@@ -157,12 +185,13 @@ async def cmd_rates(message: Message):
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     now = datetime.now(timezone.utc) + TZ_OFFSET
+    day = "рабочий" if is_trading_day() else "выходной"
     await message.answer(
         f"🤖 Статус бота\n"
         f"Время (UTC+5): {now.strftime('%d.%m.%Y %H:%M')}\n"
+        f"День: {day}\n"
         f"PINNED_MSG_ID: {pinned_message_id or 'не задан'}\n"
-        f"Расписание: {', '.join(f'{h}:00' for h in UPDATE_HOURS)}\n"
-        f"Источник: Yahoo Finance"
+        f"Расписание: {', '.join(f'{h}:00' for h in UPDATE_HOURS)} (Пн-Пт)"
     )
 
 
