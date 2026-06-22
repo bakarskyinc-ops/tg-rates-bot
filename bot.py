@@ -1,9 +1,8 @@
 import os
 import asyncio
 import logging
-import ssl
 from datetime import datetime, timezone, timedelta
-import aiohttp
+import yfinance as yf
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -16,65 +15,38 @@ CHANNEL_ID = os.environ["CHANNEL_ID"]
 
 UPDATE_HOURS = [9, 14, 20]
 TZ_OFFSET = timedelta(hours=5)
-TROY_OZ = 31.1035
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ─────────────────────────────────────────────
-# Получение курсов с ЦБ РУз
+# Получение курсов через Yahoo Finance
 # ─────────────────────────────────────────────
 
-async def get_metal_prices() -> dict | None:
-    """
-    ЦБ РУз публикует курсы XAU, XAG, XPT в сумах за тройскую унцию.
-    USD тоже берём оттуда — пересчитываем в доллары за унцию.
-    """
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)",
-        "Accept": "application/json",
-        "Referer": "https://cbu.uz/"
-    }
-
+def fetch_price(ticker: str) -> float | None:
     try:
-        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-            async with session.get(
-                "https://cbu.uz/uz/arkhiv-kursov-valyut/json/",
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                data = await r.json(content_type=None)
-
-                rates = {}
-                for item in data:
-                    ccy = item.get("Ccy")
-                    if ccy in ("USD", "XAU", "XAG", "XPT"):
-                        nominal = float(item.get("Nominal", 1))
-                        rates[ccy] = float(item["Rate"]) / nominal
-
-                if not all(k in rates for k in ("USD", "XAU", "XAG", "XPT")):
-                    logger.error(f"ЦБ: не все курсы найдены. Получено: {list(rates.keys())}")
-                    return None
-
-                usd = rates["USD"]  # UZS за 1 USD
-
-                # ЦБ даёт UZS за тройскую унцию → делим на курс USD
-                result = {
-                    "gold":     rates["XAU"] / usd,
-                    "silver":   rates["XAG"] / usd,
-                    "platinum": rates["XPT"] / usd,
-                    "usd_uzs":  usd,
-                }
-                logger.info(f"ЦБ РУз: {result}")
-                return result
-
+        t = yf.Ticker(ticker)
+        price = t.fast_info.last_price
+        if price and price > 0:
+            return float(price)
     except Exception as e:
-        logger.error(f"ЦБ API error: {e}")
-        return None
+        logger.warning(f"{ticker} failed: {e}")
+    return None
+
+
+async def get_metal_prices() -> dict | None:
+    loop = asyncio.get_event_loop()
+
+    gold     = await loop.run_in_executor(None, fetch_price, "GC=F")
+    silver   = await loop.run_in_executor(None, fetch_price, "SI=F")
+    platinum = await loop.run_in_executor(None, fetch_price, "PL=F")
+
+    if gold and silver and platinum:
+        logger.info(f"Yahoo: gold={gold}, silver={silver}, platinum={platinum}")
+        return {"gold": gold, "silver": silver, "platinum": platinum}
+
+    logger.error("Не удалось получить курсы с Yahoo Finance")
+    return None
 
 
 def format_message(gold: float, silver: float, platinum: float) -> str:
@@ -146,9 +118,8 @@ async def scheduler():
 
         next_minutes = None
         for h in UPDATE_HOURS:
-            target = h * 60
-            if target > current_minutes:
-                next_minutes = target
+            if h * 60 > current_minutes:
+                next_minutes = h * 60
                 break
 
         if next_minutes is None:
@@ -191,7 +162,7 @@ async def cmd_status(message: Message):
         f"Время (UTC+5): {now.strftime('%d.%m.%Y %H:%M')}\n"
         f"PINNED_MSG_ID: {pinned_message_id or 'не задан'}\n"
         f"Расписание: {', '.join(f'{h}:00' for h in UPDATE_HOURS)}\n"
-        f"Источник: ЦБ РУз"
+        f"Источник: Yahoo Finance"
     )
 
 
