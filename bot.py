@@ -11,8 +11,8 @@ from aiogram.types import Message
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-CHANNEL_ID  = os.environ["CHANNEL_ID"]
+BOT_TOKEN    = os.environ["BOT_TOKEN"]
+CHANNEL_ID   = os.environ["CHANNEL_ID"]
 RAPIDAPI_KEY = os.environ["RAPIDAPI_KEY"]
 
 UPDATE_HOURS = [9, 14, 20]
@@ -22,13 +22,14 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
 # ─────────────────────────────────────────────
-# Получение курсов — Real-Time Metal Prices
+# Получение курсов
 # ─────────────────────────────────────────────
 
+BASE_URL = "https://real-time-metal-prices.p.rapidapi.com/api/v1/radpidhub"
+
 METALS = {
-    "gold":     "gold-price/USD",
-    "silver":   "silver-price/USD",
-    "platinum": "platinum-price/USD",
+    "gold":   "gold-price/USD",
+    "silver": "silver-price/USD",
 }
 
 async def get_metal_prices() -> dict | None:
@@ -46,39 +47,42 @@ async def get_metal_prices() -> dict | None:
     result = {}
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         for metal, path in METALS.items():
-            url = f"https://real-time-metal-prices.p.rapidapi.com/{path}"
+            url = f"{BASE_URL}/{path}"
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
                     data = await r.json()
-                    # Ответ: {"price": 3300.5, "unit": "troy_oz", ...}
-                    price = float(data.get("price") or data.get("rate") or data.get("ask") or 0)
+                    logger.info(f"{metal} raw response: {data}")
+                    # Пробуем разные поля
+                    price = (
+                        data.get("price_usd_per_troy_oz") or
+                        data.get("price") or
+                        data.get("rate") or
+                        data.get("ask") or
+                        data.get("Price") or
+                        0
+                    )
+                    price = float(price)
                     if price > 0:
                         result[metal] = price
-                        logger.info(f"{metal}: ${price}")
                     else:
-                        logger.warning(f"{metal} — нет цены в ответе: {data}")
+                        logger.warning(f"{metal} — нет цены: {data}")
             except Exception as e:
                 logger.warning(f"{metal} failed: {e}")
 
-    if all(k in result for k in ("gold", "silver", "platinum")):
+    if all(k in result for k in ("gold", "silver")):
         return result
 
-    logger.error(f"Не удалось получить все курсы. Получено: {result}")
+    logger.error(f"Не удалось получить курсы. Получено: {result}")
     return None
 
 
 def is_trading_day() -> bool:
-    """Пн-Пт — торговые дни, Сб-Вс — нет"""
     now = datetime.now(timezone.utc) + TZ_OFFSET
-    return now.weekday() < 5  # 0=Пн, 4=Пт, 5=Сб, 6=Вс
+    return now.weekday() < 5
 
 
-def format_message(gold: float, silver: float, platinum: float) -> str:
-    return (
-        f"Gold ${gold:,.2f}  |  "
-        f"Silver ${silver:,.2f}  |  "
-        f"Platinum ${platinum:,.2f}"
-    )
+def format_message(gold: float, silver: float) -> str:
+    return f"Gold ${gold:,.2f}  |  Silver ${silver:,.2f}"
 
 
 # ─────────────────────────────────────────────
@@ -100,15 +104,14 @@ async def send_or_update_rates():
     global pinned_message_id
 
     if not is_trading_day():
-        logger.info("Выходной день — пропуск обновления")
+        logger.info("Выходной — пропуск")
         return
 
     metals = await get_metal_prices()
     if not metals:
-        logger.warning("Курсы недоступны, пропуск")
         return
 
-    text = format_message(metals["gold"], metals["silver"], metals["platinum"])
+    text = format_message(metals["gold"], metals["silver"])
 
     try:
         if pinned_message_id:
@@ -126,38 +129,29 @@ async def send_or_update_rates():
                 message_id=msg.message_id,
                 disable_notification=True
             )
-            logger.info(f"Создано и закреплено. Добавь в Railway: PINNED_MSG_ID={pinned_message_id}")
+            logger.info(f"Создано. PINNED_MSG_ID={pinned_message_id}")
     except Exception as e:
-        logger.error(f"Ошибка обновления: {e}")
+        logger.error(f"Ошибка: {e}")
 
 
 # ─────────────────────────────────────────────
-# Расписание: 09:00, 14:00, 20:00 Ташкент (Пн-Пт)
+# Расписание
 # ─────────────────────────────────────────────
 
 async def scheduler():
     await asyncio.sleep(3)
-    logger.info(f"Планировщик запущен. Обновления в {UPDATE_HOURS} по UTC+5 (только Пн-Пт)")
+    logger.info(f"Планировщик запущен. {UPDATE_HOURS} UTC+5, Пн-Пт")
     await send_or_update_rates()
 
     while True:
         now = datetime.now(timezone.utc) + TZ_OFFSET
-        current_minutes = now.hour * 60 + now.minute
+        cur = now.hour * 60 + now.minute
 
-        next_minutes = None
-        for h in UPDATE_HOURS:
-            if h * 60 > current_minutes:
-                next_minutes = h * 60
-                break
+        nxt = next((h * 60 for h in UPDATE_HOURS if h * 60 > cur), UPDATE_HOURS[0] * 60 + 1440)
+        wait = (nxt - cur) * 60 - now.second
+        logger.info(f"Следующее в {(now + timedelta(seconds=wait)).strftime('%H:%M')} (через {wait//60} мин)")
 
-        if next_minutes is None:
-            next_minutes = UPDATE_HOURS[0] * 60 + 24 * 60
-
-        wait_seconds = (next_minutes - current_minutes) * 60 - now.second
-        next_time = (now + timedelta(seconds=wait_seconds)).strftime("%H:%M")
-        logger.info(f"Следующее обновление в {next_time} (через {wait_seconds//60} мин)")
-
-        await asyncio.sleep(wait_seconds)
+        await asyncio.sleep(wait)
         await send_or_update_rates()
 
 
@@ -171,33 +165,26 @@ async def cmd_start(message: Message):
         "✅ Бот курсов металлов активен.\n"
         "Обновления в 09:00, 14:00, 20:00 по Ташкенту (Пн-Пт).\n\n"
         "/rates — текущие курсы\n"
-        "/status — статус бота"
+        "/status — статус"
     )
 
 @dp.message(Command("rates"))
 async def cmd_rates(message: Message):
     metals = await get_metal_prices()
     if metals:
-        await message.answer(format_message(metals["gold"], metals["silver"], metals["platinum"]))
+        await message.answer(format_message(metals["gold"], metals["silver"]))
     else:
         await message.answer("❌ Не удалось получить курсы.")
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     now = datetime.now(timezone.utc) + TZ_OFFSET
-    day = "рабочий" if is_trading_day() else "выходной"
     await message.answer(
-        f"🤖 Статус бота\n"
-        f"Время (UTC+5): {now.strftime('%d.%m.%Y %H:%M')}\n"
-        f"День: {day}\n"
-        f"PINNED_MSG_ID: {pinned_message_id or 'не задан'}\n"
-        f"Расписание: {', '.join(f'{h}:00' for h in UPDATE_HOURS)} (Пн-Пт)"
+        f"Время: {now.strftime('%d.%m.%Y %H:%M')}\n"
+        f"День: {'рабочий' if is_trading_day() else 'выходной'}\n"
+        f"PINNED_MSG_ID: {pinned_message_id or 'не задан'}"
     )
 
-
-# ─────────────────────────────────────────────
-# Запуск
-# ─────────────────────────────────────────────
 
 async def main():
     await load_pinned_msg_id()
